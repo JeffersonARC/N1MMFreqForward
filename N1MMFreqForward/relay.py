@@ -91,23 +91,50 @@ RED    = ("red",    "server unreachable")
 MB_OK              = 0x00000000
 MB_ICONERROR       = 0x00000010
 MB_ICONINFORMATION = 0x00000040
+MB_SETFOREGROUND   = 0x00010000
+MB_TOPMOST         = 0x00040000
+
+# Pre-bind MessageBoxW with explicit prototype. ctypes' default int-for-
+# everything guesses mostly work, but being explicit avoids subtle bugs
+# in some Windows builds.
+if sys.platform.startswith("win"):
+    try:
+        _MBW = ctypes.windll.user32.MessageBoxW
+        _MBW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                         ctypes.c_wchar_p, ctypes.c_uint]
+        _MBW.restype  = ctypes.c_int
+    except Exception:
+        _MBW = None
+else:
+    _MBW = None
 
 
 def msgbox(text: str, title: str = APP_TITLE, flags: int = MB_OK) -> None:
-    """Show a Windows MessageBox. No-op on non-Windows (for dev).
+    """Show a Windows MessageBox on a dedicated thread (fire-and-forget).
 
-    Wrapped so any failure is swallowed — if MessageBox itself dies for
-    some reason, we still want the tray to keep running.
+    Why a thread: when MessageBoxW is called from inside a pystray menu
+    callback, MessageBox's modal message loop nests inside pystray's
+    tray-icon message loop on the same thread. The dialog appears but
+    its OK / X clicks stop responding. Running the dialog on a fresh
+    thread isolates it completely. Caller does not see the return value
+    (we never use it anyway).
+
+    MB_TOPMOST | MB_SETFOREGROUND make sure the dialog actually appears
+    on top with focus, instead of hiding behind whatever app was
+    foreground a moment ago (Notepad, the tray menu, etc.).
     """
-    if not sys.platform.startswith("win"):
+    if _MBW is None:
         return
-    try:
-        ctypes.windll.user32.MessageBoxW(None, text, title, flags)
-    except Exception as e:
+    eff_flags = flags | MB_SETFOREGROUND | MB_TOPMOST
+    def _show():
         try:
-            logging.warning("MessageBox failed: %s", e)
-        except Exception:
-            pass
+            _MBW(None, text, title, eff_flags)
+        except Exception as e:
+            try:
+                logging.warning("MessageBox failed: %s", e)
+            except Exception:
+                pass
+    threading.Thread(target=_show, daemon=True, name="msgbox").start()
 
 
 # ---------------------------- config ------------------------------------
@@ -216,6 +243,10 @@ class UdpListener:
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._sockets: list[socket.socket] = []
+        # Track which ports have already logged their first packet, so we
+        # confirm UDP is reaching us without spamming the log per-packet
+        # (N1MM emits RadioInfo several times per second).
+        self._first_logged: set[int] = set()
 
     def start(self) -> None:
         for port in self.ports:
@@ -251,14 +282,24 @@ class UdpListener:
 
         while not self._stop.is_set():
             try:
-                data, _ = sock.recvfrom(8192)
+                data, addr = sock.recvfrom(8192)
             except socket.timeout:
                 continue
             except OSError:
                 break
-            self._handle(data)
+            self._handle(port, addr, data)
 
-    def _handle(self, data: bytes) -> None:
+    def _handle(self, port: int, addr, data: bytes) -> None:
+        # First packet ever on this port: log it loudly so we know UDP is
+        # actually reaching us. After that, parsing-level details stay quiet.
+        if port not in self._first_logged:
+            self._first_logged.add(port)
+            try:
+                src = f"{addr[0]}:{addr[1]}"
+            except Exception:
+                src = "?"
+            logging.info("first UDP packet on port %d (from %s, %d bytes)",
+                         port, src, len(data))
         try:
             text = data.decode("utf-8", errors="replace")
         except Exception:
@@ -271,7 +312,12 @@ class UdpListener:
             return
         if root.tag != "RadioInfo":
             return
-        tx = root.find("TXFreq") or root.find("txfreq")
+        # Explicit `is None` checks — Element objects with no children are
+        # FALSY in Python (deprecated, but still the case in 3.13), so the
+        # tempting `or` chain silently drops elements that contain only text.
+        tx = root.find("TXFreq")
+        if tx is None:
+            tx = root.find("txfreq")
         if tx is None or tx.text is None:
             return
         try:
@@ -297,7 +343,7 @@ class Relay:
         self._last_post_ok_at:  Optional[float] = None
         self._last_post_err:    Optional[str]  = None
         self._stopped = False
-        self._udp = UdpListener("127.0.0.1", config["ports"], self._on_txfreq)
+        self._udp = UdpListener("0.0.0.0", config["ports"], self._on_txfreq)
 
     def start(self) -> None:
         self._udp.start()
@@ -312,7 +358,7 @@ class Relay:
             self.config = dict(new_config)
         if old_ports != new_config["ports"]:
             self._udp.stop()
-            self._udp = UdpListener("127.0.0.1", new_config["ports"], self._on_txfreq)
+            self._udp = UdpListener("0.0.0.0", new_config["ports"], self._on_txfreq)
             self._udp.start()
 
     def status(self) -> tuple[str, str]:
@@ -557,6 +603,7 @@ def main() -> int:
                 "'Reload config'.",
                 APP_TITLE, MB_OK | MB_ICONINFORMATION,
             )
+            time.sleep(0.7)
             open_in_default_app(CONFIG_FILE)
         threading.Thread(target=first_run_prompt, daemon=True).start()
 
