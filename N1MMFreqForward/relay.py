@@ -75,6 +75,11 @@ DEFAULT_CONFIG: dict = {
     "operator_callsign":    "",
     "ports":                [12060, 13063, 13065],
     "min_send_interval_ms": 500,
+    # Watchdog: exit if N1MM never sends UDP within the first N minutes,
+    # or if N1MM goes silent for N minutes after the first packet arrives.
+    # Set either to 0 to disable that phase of the watchdog.
+    "N1MM_initial_wait_mins":    15,
+    "N1MM_wait_mins":            15,
 }
 
 # Status: (icon_color, human_text)
@@ -94,9 +99,7 @@ MB_ICONINFORMATION = 0x00000040
 MB_SETFOREGROUND   = 0x00010000
 MB_TOPMOST         = 0x00040000
 
-# Pre-bind MessageBoxW with explicit prototype. ctypes' default int-for-
-# everything guesses mostly work, but being explicit avoids subtle bugs
-# in some Windows builds.
+# Pre-bind with explicit argtypes so ctypes doesn't guess wrong on some Windows builds.
 if sys.platform.startswith("win"):
     try:
         _MBW = ctypes.windll.user32.MessageBoxW
@@ -112,20 +115,15 @@ else:
 def msgbox(text: str, title: str = APP_TITLE, flags: int = MB_OK) -> None:
     """Show a Windows MessageBox on a dedicated thread (fire-and-forget).
 
-    Why a thread: when MessageBoxW is called from inside a pystray menu
-    callback, MessageBox's modal message loop nests inside pystray's
-    tray-icon message loop on the same thread. The dialog appears but
-    its OK / X clicks stop responding. Running the dialog on a fresh
-    thread isolates it completely. Caller does not see the return value
-    (we never use it anyway).
-
-    MB_TOPMOST | MB_SETFOREGROUND make sure the dialog actually appears
-    on top with focus, instead of hiding behind whatever app was
-    foreground a moment ago (Notepad, the tray menu, etc.).
+    Why a thread: when MessageBoxW is called directly from a pystray menu
+    callback, the dialog's modal loop nests inside pystray's tray message
+    loop on the same thread — the dialog appears but OK / X clicks stop
+    responding. A fresh thread isolates the two loops completely. MB_TOPMOST | MB_SETFOREGROUND ensure the dialog appears on top with focus rather than hiding behind Notepad, the tray menu, etc.
     """
     if _MBW is None:
         return
     eff_flags = flags | MB_SETFOREGROUND | MB_TOPMOST
+
     def _show():
         try:
             _MBW(None, text, title, eff_flags)
@@ -134,6 +132,7 @@ def msgbox(text: str, title: str = APP_TITLE, flags: int = MB_OK) -> None:
                 logging.warning("MessageBox failed: %s", e)
             except Exception:
                 pass
+
     threading.Thread(target=_show, daemon=True, name="msgbox").start()
 
 
@@ -344,6 +343,12 @@ class Relay:
         self._last_post_err:    Optional[str]  = None
         self._stopped = False
         self._udp = UdpListener("0.0.0.0", config["ports"], self._on_txfreq)
+
+    @property
+    def last_udp_at(self) -> Optional[float]:
+        """Monotonic timestamp of the most recent UDP packet, or None."""
+        with self._lock:
+            return self._last_udp_at
 
     def start(self) -> None:
         self._udp.start()
@@ -606,6 +611,71 @@ def main() -> int:
             time.sleep(0.7)
             open_in_default_app(CONFIG_FILE)
         threading.Thread(target=first_run_prompt, daemon=True).start()
+
+    # Watchdog: auto-exit when N1MM stops sending.
+    #
+    # Phase 1 — initial wait: if no UDP at all arrives within
+    #   N1MM_initial_wait_mins, assume N1MM isn't running and exit.
+    # Phase 2 — rolling: after the first packet, restart the clock on
+    #   every packet; exit when wait_mins elapses with no new UDP.
+    # Either phase is disabled by setting its value to 0 in config.
+    #
+    # The watchdog reads wait times from relay.config on each iteration
+    # so a Reload picks up new values immediately.
+    #
+    # on_quit is used as the exit action — same clean shutdown path as
+    # the Quit menu item.
+    def _watchdog():
+        # ---- phase 1: wait for first packet ----
+        with relay._lock:
+            initial_mins = int(relay.config.get("N1MM_initial_wait_mins", 15))
+        if initial_mins > 0:
+            deadline = time.monotonic() + initial_mins * 60
+            logging.info("watchdog: waiting up to %d min for first N1MM UDP",
+                         initial_mins)
+            while time.monotonic() < deadline:
+                time.sleep(10)
+                if relay._stopped:
+                    return
+                if relay.last_udp_at is not None:
+                    break
+            else:
+                # timed out with no UDP at all
+                logging.info("watchdog: no UDP in %d min — exiting", initial_mins)
+                msgbox(
+                    f"No N1MM UDP received in the first {initial_mins} minutes.\n\n"
+                    f"N1MM Frequency Forwarder will now exit.\n\n"
+                    f"Check that N1MM is running and that 'Radio' is ticked on the\n"
+                    f"Broadcast Data tab pointing to 127.0.0.1:12060.",
+                    APP_TITLE, MB_OK | MB_ICONINFORMATION,
+                )
+                time.sleep(3)   # give the MessageBox thread a moment to appear
+                on_quit()
+                return
+
+        # ---- phase 2: rolling watchdog ----
+        while not relay._stopped:
+            time.sleep(30)      # check every 30 seconds
+            with relay._lock:
+                wait_mins = int(relay.config.get("N1MM_wait_mins", 15))
+            if wait_mins <= 0:
+                continue        # rolling watchdog disabled
+            last = relay.last_udp_at
+            if last is not None:
+                age_mins = (time.monotonic() - last) / 60
+                if age_mins >= wait_mins:
+                    logging.info("watchdog: no UDP for %.1f min — exiting",
+                                 age_mins)
+                    msgbox(
+                        f"No N1MM UDP received for {wait_mins} minutes.\n\n"
+                        f"N1MM Frequency Forwarder will now exit.",
+                        APP_TITLE, MB_OK | MB_ICONINFORMATION,
+                    )
+                    time.sleep(3)
+                    on_quit()
+                    return
+
+    threading.Thread(target=_watchdog, name="watchdog", daemon=True).start()
 
     # icon.run() blocks on the main thread, which is exactly what
     # pystray wants on Windows.
